@@ -252,10 +252,13 @@ def option(*param_decls: str, cls: type[click.Option] | None = None, **attrs: An
     help='Include the full client IP in the inner flow key (fair scheduler)',
 )
 @option(
+    '--monitoring-tool-id',
     '--fq-monitoring-tool-id',
+    'monitoring_tool_id',
     type=click.IntRange(0, 5),
     default=4,
-    help='sys.monitoring tool ID used to measure lane occupancy (fair scheduler)',
+    envvar=['GRANIAN_MONITORING_TOOL_ID', 'GRANIAN_FQ_MONITORING_TOOL_ID'],
+    help='sys.monitoring tool ID used to measure lane occupancy (fair scheduler and load stats)',
 )
 @option(
     '--http1-buffer-size',
@@ -550,7 +553,7 @@ def cli(
     fq_inner_headers: str,
     fq_inner_cookies: str,
     fq_inner_include_ip: bool,
-    fq_monitoring_tool_id: int,
+    monitoring_tool_id: int,
     http1_buffer_size: int,
     http1_header_read_timeout: int,
     http1_keep_alive: bool,
@@ -651,7 +654,7 @@ def cli(
         fq_inner_headers=fq_inner_headers,
         fq_inner_cookies=fq_inner_cookies,
         fq_inner_include_ip=fq_inner_include_ip,
-        fq_monitoring_tool_id=fq_monitoring_tool_id,
+        monitoring_tool_id=monitoring_tool_id,
         http1_settings=HTTP1Settings(
             header_read_timeout=http1_header_read_timeout,
             keep_alive=http1_keep_alive,

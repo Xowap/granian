@@ -55,6 +55,8 @@ pub(crate) trait Scheduler: Send + Sync + 'static {
     fn debit(&self, flow: &FlowRef, cost_ns: u64);
 
     fn push(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError>;
+    /// Queue a task of Granian's own, served before every other queued task.
+    fn push_system(&self, task: BlockingTask) -> Result<(), PushError>;
     fn pop(&self) -> Option<BlockingTask>;
     fn pop_timeout(&self, d: Duration) -> Result<BlockingTask, PopError>;
     fn len(&self) -> usize;
@@ -81,12 +83,16 @@ pub(crate) trait Scheduler: Send + Sync + 'static {
 pub(crate) struct FifoScheduler {
     tx: channel::Sender<BlockingTask>,
     rx: channel::Receiver<BlockingTask>,
+    /// The system lane, served first.
+    ptx: channel::Sender<BlockingTask>,
+    prx: channel::Receiver<BlockingTask>,
 }
 
 impl FifoScheduler {
     pub fn new() -> Self {
         let (tx, rx) = channel::unbounded();
-        Self { tx, rx }
+        let (ptx, prx) = channel::unbounded();
+        Self { tx, rx, ptx, prx }
     }
 }
 
@@ -108,22 +114,36 @@ impl Scheduler for FifoScheduler {
     }
 
     #[inline]
+    fn push_system(&self, task: BlockingTask) -> Result<(), PushError> {
+        self.ptx.send(task).map_err(|_| PushError)
+    }
+
+    #[inline]
     fn pop(&self) -> Option<BlockingTask> {
-        self.rx.recv().ok()
+        if let Ok(task) = self.prx.try_recv() {
+            return Some(task);
+        }
+        channel::select! {
+            recv(self.prx) -> task => task.ok(),
+            recv(self.rx) -> task => task.ok(),
+        }
     }
 
     #[inline]
     fn pop_timeout(&self, d: Duration) -> Result<BlockingTask, PopError> {
-        match self.rx.recv_timeout(d) {
-            Ok(task) => Ok(task),
-            Err(channel::RecvTimeoutError::Timeout) => Err(PopError::Timeout),
-            Err(channel::RecvTimeoutError::Disconnected) => Err(PopError::Closed),
+        if let Ok(task) = self.prx.try_recv() {
+            return Ok(task);
+        }
+        channel::select! {
+            recv(self.prx) -> task => task.map_err(|_| PopError::Closed),
+            recv(self.rx) -> task => task.map_err(|_| PopError::Closed),
+            default(d) => Err(PopError::Timeout),
         }
     }
 
     #[inline]
     fn len(&self) -> usize {
-        self.rx.len()
+        self.rx.len() + self.prx.len()
     }
 }
 
@@ -795,6 +815,10 @@ impl Scheduler for FairScheduler {
     fn push(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
         FairScheduler::push(self, task, flow)
     }
+    fn push_system(&self, task: BlockingTask) -> Result<(), PushError> {
+        // flow-less tasks go to the system lane
+        FairScheduler::push(self, task, None)
+    }
     fn pop(&self) -> Option<BlockingTask> {
         FairScheduler::pop(self)
     }
@@ -873,6 +897,14 @@ impl Scheduler for SchedulerImpl {
     }
 
     #[inline]
+    fn push_system(&self, task: BlockingTask) -> Result<(), PushError> {
+        match self {
+            Self::Fifo(s) => s.push_system(task),
+            Self::Fair(s) => Scheduler::push_system(s, task),
+        }
+    }
+
+    #[inline]
     fn pop(&self) -> Option<BlockingTask> {
         match self {
             Self::Fifo(s) => s.pop(),
@@ -930,8 +962,6 @@ impl Scheduler for SchedulerImpl {
 #[derive(Clone)]
 pub(crate) struct FairConfig {
     inner: FairConfigInner,
-    #[pyo3(get)]
-    pub(crate) monitoring_tool_id: u8,
 }
 
 #[pymethods]
@@ -958,7 +988,6 @@ impl FairConfig {
         ],
         inner_cookies=vec!["sessionid".to_string(), "session".to_string()],
         inner_include_ip=true,
-        monitoring_tool_id=4,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -975,7 +1004,6 @@ impl FairConfig {
         inner_headers: Vec<String>,
         inner_cookies: Vec<String>,
         inner_include_ip: bool,
-        monitoring_tool_id: u8,
     ) -> PyResult<Self> {
         let client_ip_header = HeaderName::from_bytes(client_ip_header.as_bytes())
             .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid client IP header name"))?;
@@ -996,7 +1024,6 @@ impl FairConfig {
                 inner_cookies,
                 inner_include_ip,
             },
-            monitoring_tool_id,
         })
     }
 }
@@ -1151,7 +1178,6 @@ mod tests {
             vec!["user-agent".to_string()],
             vec!["sessionid".to_string()],
             true,
-            4,
         )
         .unwrap()
     }
@@ -1207,6 +1233,27 @@ mod tests {
         run_task(sched.pop_timeout(Duration::from_millis(0)).unwrap());
 
         assert_eq!(*order.lock().unwrap(), vec![1, 0]);
+    }
+
+    #[test]
+    fn fifo_system_lane_is_served_first() {
+        let sched = FifoScheduler::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        sched.push(task(&order, 0), None).unwrap();
+        sched.push(task(&order, 1), None).unwrap();
+        sched.push_system(task(&order, 2)).unwrap();
+        assert_eq!(sched.len(), 3);
+
+        run_task(sched.pop().unwrap());
+        run_task(sched.pop_timeout(Duration::from_millis(0)).unwrap());
+        run_task(sched.pop_timeout(Duration::from_millis(0)).unwrap());
+        assert_eq!(
+            sched.pop_timeout(Duration::from_millis(0)).err(),
+            Some(PopError::Timeout)
+        );
+
+        assert_eq!(*order.lock().unwrap(), vec![2, 0, 1]);
     }
 
     #[test]

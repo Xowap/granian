@@ -105,8 +105,16 @@ pub(crate) struct WorkerConfig {
     pub static_files: Option<(Vec<(String, String)>, Option<String>, Option<String>)>,
     pub tls_opts: Option<WorkerTlsConfig>,
     pub scheduler: SchedulerConfig,
-    /// Whether the `sys.monitoring` occupancy hooks must be installed (async interfaces with fair).
+    /// Whether lane occupancy is measured with the `sys.monitoring` hooks (async interfaces)
+    /// rather than around the pool tasks (WSGI). The hooks are installed for the fair
+    /// scheduler, or once load stats get enabled (see `crate::load`).
     pub monitoring: bool,
+    /// The `sys.monitoring` tool ID used by those hooks.
+    pub monitoring_tool_id: u8,
+    /// The worker's load, measured once the stats reporter enables it.
+    pub load: crate::load::ArcWorkerLoad,
+    /// Where the worker sends its load samples; taken when it starts serving.
+    pub load_sink: Mutex<Option<crate::load::LoadSink>>,
     pub metrics: (
         Option<std::time::Duration>,
         Option<Py<crate::metrics::MetricsAggregator>>,
@@ -185,8 +193,30 @@ impl WorkerConfig {
                 None => SchedulerConfig::Fifo,
             },
             monitoring: false,
+            monitoring_tool_id: 4,
+            load: Arc::new(crate::load::WorkerLoad::new(py_threads, false)),
+            load_sink: Mutex::new(None),
             metrics: (metrics.0.map(std::time::Duration::from_secs), metrics.1),
         }
+    }
+
+    /// Finish the configuration once the interface is known: `monitoring` (async interfaces)
+    /// measures lane occupancy with `sys.monitoring` hooks, otherwise (WSGI) around pool
+    /// tasks. `load` is the server's load aggregator, or this worker's channel to it.
+    pub fn with_load(
+        mut self,
+        monitoring: bool,
+        monitoring_tool_id: u8,
+        load: Option<&Bound<PyAny>>,
+    ) -> PyResult<Self> {
+        self.monitoring = monitoring;
+        self.monitoring_tool_id = monitoring_tool_id;
+        self.load = Arc::new(crate::load::WorkerLoad::new(self.py_threads, !monitoring));
+        if let Some(load) = load {
+            let slot = usize::try_from(self.id - 1).unwrap_or_default();
+            *self.load_sink.lock().unwrap() = Some(crate::load::LoadSink::from_py(load, slot)?);
+        }
+        Ok(self)
     }
 
     pub fn tcp_listener(&self) -> std::net::TcpListener {

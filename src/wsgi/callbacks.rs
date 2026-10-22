@@ -127,9 +127,11 @@ pub(crate) fn call_http(
     let (tx, rx) = oneshot::channel();
     let protocol = WSGIProtocol::new(rrt, tx);
     let body = WSGIBody::new(rt.clone(), body);
+    let in_flight = rt.load().and_then(crate::load::WorkerLoad::in_flight);
 
     rt.spawn_blocking_flow(
         move |py| {
+            let _in_flight = in_flight;
             let Ok(proto) = Py::new(py, protocol) else {
                 return;
             };

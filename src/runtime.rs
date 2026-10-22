@@ -14,6 +14,7 @@ use super::callbacks::{PyFutureDoneCallback, PyFutureResultSetter};
 use super::blocking;
 use super::callbacks::{PyDoneAwaitable, PyEmptyAwaitable, PyErrAwaitable, PyIterAwaitable};
 use super::conversion::FutureResultToPy;
+use super::load;
 use super::metrics;
 use super::net::SockAddr;
 use super::scheduler::{FlowRef, Scheduler, SchedulerImpl};
@@ -57,6 +58,7 @@ pub(crate) struct RuntimeWrapper {
     pr: Arc<Py<PyAny>>,
     sig: Arc<tokio::sync::Notify>,
     sched: Arc<SchedulerImpl>,
+    load: Option<load::ArcWorkerLoad>,
 }
 
 impl RuntimeWrapper {
@@ -67,8 +69,12 @@ impl RuntimeWrapper {
         py_loop: Arc<Py<PyAny>>,
         metrics: Option<metrics::ArcWorkerMetrics>,
         scheduler: Option<Arc<SchedulerImpl>>,
+        load: Option<load::ArcWorkerLoad>,
     ) -> Self {
         let sched = scheduler.unwrap_or_else(|| Arc::new(SchedulerImpl::fifo()));
+        if let Some(load) = &load {
+            load.add_scheduler(&sched);
+        }
         let br = match metrics {
             Some(metrics) => blocking::BlockingRunner::new_with_metrics(
                 py_threads,
@@ -84,6 +90,7 @@ impl RuntimeWrapper {
             pr: py_loop,
             sig: tokio::sync::Notify::new().into(),
             sched,
+            load,
         }
     }
 
@@ -94,8 +101,12 @@ impl RuntimeWrapper {
         py_loop: Arc<Py<PyAny>>,
         metrics: Option<metrics::ArcWorkerMetrics>,
         scheduler: Option<Arc<SchedulerImpl>>,
+        load: Option<load::ArcWorkerLoad>,
     ) -> Self {
         let sched = scheduler.unwrap_or_else(|| Arc::new(SchedulerImpl::fifo()));
+        if let Some(load) = &load {
+            load.add_scheduler(&sched);
+        }
         let br = match metrics {
             Some(metrics) => blocking::BlockingRunner::new_with_metrics(
                 py_threads,
@@ -111,6 +122,7 @@ impl RuntimeWrapper {
             pr: py_loop,
             sig: tokio::sync::Notify::new().into(),
             sched,
+            load,
         }
     }
 
@@ -121,6 +133,7 @@ impl RuntimeWrapper {
             self.pr.clone(),
             self.sig.clone(),
             self.sched.clone(),
+            self.load.clone(),
         )
     }
 }
@@ -132,6 +145,7 @@ pub struct RuntimeRef {
     innerp: Arc<Py<PyAny>>,
     sig: Arc<tokio::sync::Notify>,
     sched: Arc<SchedulerImpl>,
+    load: Option<load::ArcWorkerLoad>,
 }
 
 impl RuntimeRef {
@@ -141,6 +155,7 @@ impl RuntimeRef {
         pyloop: Arc<Py<PyAny>>,
         sig: Arc<tokio::sync::Notify>,
         sched: Arc<SchedulerImpl>,
+        load: Option<load::ArcWorkerLoad>,
     ) -> Self {
         Self {
             inner: rt,
@@ -148,7 +163,20 @@ impl RuntimeRef {
             innerp: pyloop,
             sig,
             sched,
+            load,
         }
+    }
+
+    /// The load of the worker this runtime belongs to.
+    #[inline]
+    pub fn load(&self) -> Option<&load::ArcWorkerLoad> {
+        self.load.as_ref()
+    }
+
+    /// Whether the worker currently measures load.
+    #[inline]
+    pub fn measuring_load(&self) -> bool {
+        self.load.as_ref().is_some_and(|load| load.enabled())
     }
 
     pub fn close(&self) {
@@ -209,7 +237,9 @@ impl Runtime for RuntimeRef {
     where
         F: FnOnce(Python) + Send + 'static,
     {
-        _ = self.innerb.run(task);
+        _ = self
+            .innerb
+            .run(blocking::BlockingTask::measured(task, self.load.as_ref()), None);
     }
 
     #[inline]
@@ -217,7 +247,9 @@ impl Runtime for RuntimeRef {
     where
         F: FnOnce(Python) + Send + 'static,
     {
-        _ = self.innerb.run_with_flow(task, flow);
+        _ = self
+            .innerb
+            .run(blocking::BlockingTask::measured(task, self.load.as_ref()), flow);
     }
 
     fn spawn_cancellable<F>(&self, on_cancel: Arc<tokio::sync::Notify>, fut: F) -> Self::JoinHandle
@@ -314,6 +346,7 @@ pub(crate) fn init_runtime_mt(
     py_loop: Arc<Py<PyAny>>,
     metrics: Option<metrics::ArcWorkerMetrics>,
     scheduler: Option<Arc<SchedulerImpl>>,
+    load: Option<load::ArcWorkerLoad>,
 ) -> RuntimeWrapper {
     RuntimeWrapper::with_runtime(
         RuntimeBuilder::new_multi_thread()
@@ -327,6 +360,7 @@ pub(crate) fn init_runtime_mt(
         py_loop,
         metrics,
         scheduler,
+        load,
     )
 }
 
@@ -337,6 +371,7 @@ pub(crate) fn init_runtime_st(
     py_loop: Arc<Py<PyAny>>,
     metrics: Option<metrics::ArcWorkerMetrics>,
     scheduler: Option<Arc<SchedulerImpl>>,
+    load: Option<load::ArcWorkerLoad>,
 ) -> RuntimeWrapper {
     RuntimeWrapper::new(
         blocking_threads,
@@ -345,6 +380,7 @@ pub(crate) fn init_runtime_st(
         py_loop,
         metrics,
         scheduler,
+        load,
     )
 }
 

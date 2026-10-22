@@ -11,7 +11,7 @@ from types import coroutine as _coroutine
 from ._granian import CallbackScheduler as _BaseCBScheduler, request_acct_var as _request_acct_var
 
 
-#: Set (by the fair scheduler only) in the context of every tracked request.
+#: Set in the context of every request tracked by the fair scheduler or measured for load stats.
 _acct_var = _request_acct_var()
 
 
@@ -19,7 +19,7 @@ def _future_watcher_wrapper(inner):
     async def future_watcher(watcher):
         try:
             acct = _acct_var.get(None)
-            if acct is None:
+            if acct is None or not acct.fair:
                 await inner(watcher.scope, watcher.proto)
             else:
                 await _fair_steps(inner(watcher.scope, watcher.proto), acct)

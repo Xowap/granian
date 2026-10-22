@@ -14,6 +14,7 @@ from .._granian import (
     FairConfig,
     IPCReceiverHandle,
     IPCSenderHandle,
+    LoadAggregator,
     ProcInfoCollector,
     RSGIWorker,
     SocketHolder,
@@ -24,6 +25,7 @@ from .._internal import load_env
 from .._types import SSLCtx
 from ..asgi import LifespanProtocol, _callback_wrapper as _asgi_call_wrap
 from ..rsgi import _callback_wrapper as _rsgi_call_wrap, _callbacks_from_target as _rsgi_cbs_from_target
+from ..stats import stats_reporter
 from ..wsgi import _callback_wrapper as _wsgi_call_wrap
 from .common import (
     WORKERS_METHODS,
@@ -81,17 +83,23 @@ class WorkerProcess(AbstractWorker):
             load_env(env_files)
 
             _ipc_handle = None
+            ipc, load_ipc = ipc
             sock, _sso = sock
             if sys.platform == 'win32':
                 sock = (None, SocketHolder(_sso.fileno()))
-            elif ipc:
-                _ipc_fd = os.dup(ipc.fileno())
-                os.set_blocking(_ipc_fd, False)
-                _ipc_handle = IPCSenderHandle(_ipc_fd)
+                # NOTE: no IPC on Windows, but there's a single worker: it aggregates its own load.
+                load = LoadAggregator(1, stats_reporter._deliver)
+                load.run_local(WorkerSignal())
+            else:
+                if ipc:
+                    _ipc_fd = os.dup(ipc.fileno())
+                    os.set_blocking(_ipc_fd, False)
+                    _ipc_handle = IPCSenderHandle(_ipc_fd)
+                load = os.dup(load_ipc.fileno()) if load_ipc else None
 
             loop = loops.get(loop_impl)
             callback = callback_loader()
-            return target(worker_id, callback, sock, _ipc_handle, loop, *args, **kwargs)
+            return target(worker_id, callback, sock, (_ipc_handle, load), loop, *args, **kwargs)
 
         return wrapped
 
@@ -137,8 +145,10 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
         metrics: Any,
     ):
+        ipc, load = ipc
         from granian._signals import set_loop_signals
 
         wcallback = _future_watcher_wrapper(_asgi_call_wrap(callback, scope_opts, {}, log_access_fmt))
@@ -173,11 +183,15 @@ class MPServer(AbstractServer[WorkerProcess]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
 
     @staticmethod
     @WorkerProcess.wrap_target
@@ -203,8 +217,10 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
         metrics: Any,
     ):
+        ipc, load = ipc
         from granian._signals import set_loop_signals
 
         lifespan_handler = LifespanProtocol(callback)
@@ -247,11 +263,15 @@ class MPServer(AbstractServer[WorkerProcess]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
         loop.run_until_complete(lifespan_handler.shutdown())
 
     @staticmethod
@@ -278,8 +298,10 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
         metrics: Any,
     ):
+        ipc, load = ipc
         from granian._signals import set_loop_signals
 
         callback, callback_init, callback_del = _rsgi_cbs_from_target(callback)
@@ -317,11 +339,15 @@ class MPServer(AbstractServer[WorkerProcess]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
         callback_del(loop)
 
     @staticmethod
@@ -348,8 +374,10 @@ class MPServer(AbstractServer[WorkerProcess]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
         metrics: Any,
     ):
+        ipc, load = ipc
         from granian._signals import set_sync_signals
 
         wcallback = _wsgi_call_wrap(callback, scope_opts, log_access_fmt)
@@ -380,11 +408,15 @@ class MPServer(AbstractServer[WorkerProcess]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), False)
         serve(scheduler, loop, shutdown_event)
         _main()
+        stats_reporter._detach(worker_id)
 
     def _init_shared_socket(self):
         super()._init_shared_socket()
@@ -406,6 +438,7 @@ class MPServer(AbstractServer[WorkerProcess]):
     def _start_ipc(self):
         self._ipc = {}
         self._ipc_sig = WorkerSignal()
+        self._load_ipc = {}
 
         # NOTE: for "reasons", on Windows the call to `os.set_blocking` fails with an OS err 9.
         #       I'm not sure what the problem is, thus on Windows we just disable
@@ -426,11 +459,17 @@ class MPServer(AbstractServer[WorkerProcess]):
             os.set_blocking(rxd, False)
             self._ipc[idx] = (IPCReceiverHandle(idx, rxd), tx, rx)
 
-        # NOTE: given we use IPC only for metrics right now, let's run the receivers
-        #       only if metrics collection is actually enabled.
+        # NOTE: the metrics pipes are only used if metrics collection is actually enabled.
         if self.metrics_enabled:
             for pipe in self._ipc.values():
                 pipe[0].run(self._ipc_sig, self._metrics)
+
+        # NOTE: load stats get enabled by the application, from within the workers, so the
+        #       main process can't know in advance whether they will be used: the channels
+        #       are always set up, and stay idle until a worker sends its first sample.
+        for idx in range(self.workers):
+            self._load_ipc[idx] = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        LoadAggregator(self.workers).run(self._ipc_sig, [os.dup(pair[0].fileno()) for pair in self._load_ipc.values()])
 
     def _stop_ipc(self):
         self._ipc_sig.set()
@@ -472,9 +511,11 @@ class MPServer(AbstractServer[WorkerProcess]):
                 self.process_name,
                 callback_loader,
                 ((self._ssp, self._shd), self._sso),
-                # NOTE: given we use IPC only for metrics right now, let's share the pipe
-                #       only if metrics collection is actually enabled.
-                self._ipc[idx][1] if self.metrics_enabled else None,
+                # NOTE: the metrics pipe is shared only if metrics collection is actually enabled.
+                (
+                    self._ipc[idx][1] if self.metrics_enabled else None,
+                    self._load_ipc[idx][1] if self._load_ipc else None,
+                ),
                 self.loop,
                 self.log_enabled,
                 self.log_level,
@@ -496,6 +537,7 @@ class MPServer(AbstractServer[WorkerProcess]):
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
                 self.fq_config,
+                self.monitoring_tool_id,
                 (self.metrics_scrape_interval if self.metrics_enabled else None, None),
             ),
         )

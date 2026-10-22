@@ -41,6 +41,8 @@ impl ASGIWorker {
             ssl_client_verify=false,
             scheduler=None,
             metrics=(None, None),
+            monitoring_tool_id=4,
+            load=None,
         )
     )]
     fn new(
@@ -68,9 +70,10 @@ impl ASGIWorker {
         ssl_client_verify: bool,
         scheduler: Option<Py<crate::scheduler::FairConfig>>,
         metrics: (Option<u64>, Option<Py<crate::metrics::MetricsAggregator>>),
+        monitoring_tool_id: u8,
+        load: Option<Bound<PyAny>>,
     ) -> PyResult<Self> {
-        let monitoring = scheduler.is_some();
-        let mut config = WorkerConfig::new(
+        let config = WorkerConfig::new(
             worker_id,
             sock,
             ipc,
@@ -94,9 +97,14 @@ impl ASGIWorker {
             ssl_client_verify,
             scheduler,
             metrics,
-        );
-        config.monitoring = monitoring;
+        )
+        .with_load(true, monitoring_tool_id, load.as_ref())?;
         Ok(Self { config })
+    }
+
+    /// The worker's load, for `granian.stats.stats_reporter`.
+    fn load_handle(&self) -> crate::load::LoadHandle {
+        crate::load::LoadHandle::new(self.config.load.clone())
     }
 
     fn serve_mtr(

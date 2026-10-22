@@ -5,26 +5,49 @@ use std::{
 };
 
 use super::{
-    metrics,
+    load, metrics,
     scheduler::{FlowRef, PopError, PushError, Scheduler, SchedulerImpl},
 };
 
 pub(crate) struct BlockingTask {
     inner: Box<dyn FnOnce(Python) + Send + 'static>,
+    /// The worker's load and when the task was queued, if it was measuring load then.
+    load: Option<(load::ArcWorkerLoad, time::Instant)>,
 }
 
 impl BlockingTask {
+    /// A task left out of the load stats.
     #[inline]
     pub fn new<T>(inner: T) -> BlockingTask
     where
         T: FnOnce(Python) + Send + 'static,
     {
-        Self { inner: Box::new(inner) }
+        Self {
+            inner: Box::new(inner),
+            load: None,
+        }
+    }
+
+    /// A task of the worker owning `load`, measured if it currently measures load.
+    #[inline]
+    pub fn measured<T>(inner: T, load: Option<&load::ArcWorkerLoad>) -> BlockingTask
+    where
+        T: FnOnce(Python) + Send + 'static,
+    {
+        Self {
+            inner: Box::new(inner),
+            load: load
+                .filter(|load| load.enabled())
+                .map(|load| (load.clone(), time::Instant::now())),
+        }
     }
 
     #[inline(always)]
     pub fn run(self, py: Python) {
-        (self.inner)(py);
+        match self.load {
+            None => (self.inner)(py),
+            Some((load, pushed_at)) => load.run_task(py, pushed_at, self.inner),
+        }
     }
 }
 
@@ -66,18 +89,7 @@ impl BlockingRunner {
     }
 
     #[inline]
-    pub fn run<T>(&self, task: T) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
-        self.run_with_flow(task, None)
-    }
-
-    #[inline]
-    pub fn run_with_flow<T>(&self, task: T, flow: Option<&FlowRef>) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
+    pub fn run(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
         match self {
             Self::Mono(runner) => runner.run(task, flow),
             Self::Pool(runner) => runner.run(task, flow),
@@ -109,11 +121,8 @@ impl BlockingRunnerMono<()> {
     }
 
     #[inline]
-    pub fn run<T>(&self, task: T, flow: Option<&FlowRef>) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
-        self.sched.push(BlockingTask::new(task), flow)
+    pub fn run(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
+        self.sched.push(task, flow)
     }
 }
 
@@ -130,11 +139,8 @@ impl BlockingRunnerMono<metrics::ArcWorkerMetrics> {
     }
 
     #[inline]
-    pub fn run<T>(&self, task: T, flow: Option<&FlowRef>) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
-        self.sched.push(BlockingTask::new(task), flow).map(|()| {
+    pub fn run(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
+        self.sched.push(task, flow).map(|()| {
             self.metrics.blocking_queue.fetch_add(1, atomic::Ordering::Relaxed);
         })
     }
@@ -194,12 +200,9 @@ impl BlockingRunnerPool<()> {
     }
 
     #[inline]
-    pub fn run<T>(&self, task: T, flow: Option<&FlowRef>) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
+    pub fn run(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
         let threads = self.threads.load(atomic::Ordering::Relaxed).cast_signed();
-        self.sched.push(BlockingTask::new(task), flow)?;
+        self.sched.push(task, flow)?;
         let idle = self.idle.load(atomic::Ordering::Relaxed).cast_signed();
         let overload = self.sched.len().cast_signed() - idle;
         if (overload > 0) && (threads < self.tmax.cast_signed()) {
@@ -261,16 +264,13 @@ impl BlockingRunnerPool<metrics::ArcWorkerMetrics> {
     }
 
     #[inline]
-    pub fn run<T>(&self, task: T, flow: Option<&FlowRef>) -> Result<(), PushError>
-    where
-        T: FnOnce(Python) + Send + 'static,
-    {
+    pub fn run(&self, task: BlockingTask, flow: Option<&FlowRef>) -> Result<(), PushError> {
         let threads = self
             .metrics
             .blocking_threads
             .load(atomic::Ordering::Relaxed)
             .cast_signed();
-        self.sched.push(BlockingTask::new(task), flow)?;
+        self.sched.push(task, flow)?;
         self.metrics.blocking_queue.fetch_add(1, atomic::Ordering::Relaxed);
         let idle = self.idle.load(atomic::Ordering::Relaxed).cast_signed();
         let overload = self.sched.len().cast_signed() - idle;

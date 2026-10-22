@@ -29,7 +29,7 @@ def test_fair_scheduler_config():
     assert server.fq_config['inner_headers'][0] == 'user-agent'
     assert server.fq_config['inner_cookies'] == ['sessionid', 'session']
     assert server.fq_config['inner_include_ip'] is True
-    assert server.fq_config['monitoring_tool_id'] == 4
+    assert server.monitoring_tool_id == 4
 
 
 def test_fair_scheduler_config_overrides():
@@ -53,7 +53,7 @@ def test_fair_scheduler_config_overrides():
     assert server.fq_config['debt_ttl_secs'] == 5
     assert server.fq_config['trusted_proxies'] == ['*']
     assert server.fq_config['inner_include_ip'] is False
-    assert server.fq_config['monitoring_tool_id'] == 3
+    assert server.monitoring_tool_id == 3
 
 
 @pytest.mark.asyncio

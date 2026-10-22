@@ -48,10 +48,16 @@ macro_rules! serve_fn {
                     rtpyloop,
                     metrics.1.clone(),
                     scheduler,
+                    Some(cfg.load.clone()),
                 )
             });
             let rth = rt.handler();
             let (stx, srx) = tokio::sync::watch::channel(false);
+            let sampler = crate::load::spawn_sampler(
+                cfg.load.clone(),
+                cfg.load_sink.lock().unwrap().take(),
+                srx.clone(),
+            );
             let cvar = Arc::new((Mutex::new(false), Condvar::new()));
             let mc_notify = Arc::new(tokio::sync::Notify::new());
 
@@ -112,6 +118,9 @@ macro_rules! serve_fn {
                 while !*done {
                     done = cvar.wait(done).unwrap();
                 }
+                if let Some(sampler) = sampler {
+                    _ = sampler.join();
+                }
 
                 Python::attach(|py| {
                     _ = pysig.get().release(py);
@@ -162,6 +171,11 @@ macro_rules! serve_fn {
             let py_loop = Arc::new(event_loop.clone().unbind());
             let mc_notify = Arc::new(tokio::sync::Notify::new());
             let scheduler = build_scheduler(cfg);
+            let sampler = crate::load::spawn_sampler(
+                cfg.load.clone(),
+                cfg.load_sink.lock().unwrap().take(),
+                srx.clone(),
+            );
 
             let metrics_thread = if let Some(metrics_interval) = cfg.metrics.0 {
                 let metrics = metrics.1.clone().unwrap();
@@ -174,7 +188,7 @@ macro_rules! serve_fn {
                 let scheduler = scheduler.clone();
 
                 let thread = std::thread::spawn(move || {
-                    let rt = crate::runtime::init_runtime_st(1, 0, 0, py_loop, None, scheduler);
+                    let rt = crate::runtime::init_runtime_st(1, 0, 0, py_loop, None, scheduler, None);
                     let local = tokio::task::LocalSet::new();
 
                     #[cfg(not(Py_GIL_DISABLED))]
@@ -225,6 +239,7 @@ macro_rules! serve_fn {
                 let py_loop = py_loop.clone();
                 let srx = srx.clone();
                 let scheduler = scheduler.clone();
+                let load = cfg.load.clone();
 
                 workers.push(std::thread::spawn(move || {
                     let rt = crate::runtime::init_runtime_st(
@@ -234,6 +249,7 @@ macro_rules! serve_fn {
                         py_loop,
                         metrics.1.clone(),
                         scheduler,
+                        Some(load),
                     );
                     let rth = rt.handler();
                     let wrk = crate::workers::Worker::new(ctx, acceptor, handler, rth, target, metrics.0);
@@ -268,6 +284,9 @@ macro_rules! serve_fn {
                 }
                 if let Some(thread) = metrics_thread {
                     thread.join().unwrap();
+                }
+                if let Some(sampler) = sampler {
+                    _ = sampler.join();
                 }
 
                 Python::attach(|py| {
@@ -321,6 +340,12 @@ macro_rules! serve_fn {
             let (stx, srx) = tokio::sync::watch::channel(false);
             let py_loop = Arc::new(event_loop.clone().unbind());
             let scheduler = build_scheduler(cfg);
+            let load = cfg.load.clone();
+            let sampler = crate::load::spawn_sampler(
+                cfg.load.clone(),
+                cfg.load_sink.lock().unwrap().take(),
+                srx.clone(),
+            );
 
             let worker = std::thread::spawn(move || {
                 let rt = crate::runtime::init_runtime_st(
@@ -330,6 +355,7 @@ macro_rules! serve_fn {
                     py_loop,
                     metrics.1.clone(),
                     scheduler,
+                    Some(load),
                 );
                 let rth = rt.handler();
                 let wrk = crate::workers::Worker::new(ctx, acceptor, handler, rth, target, metrics.0);
@@ -356,6 +382,9 @@ macro_rules! serve_fn {
                 _ = pyrx.recv();
                 _ = stx.send(true);
                 worker.join().unwrap();
+                if let Some(sampler) = sampler {
+                    _ = sampler.join();
+                }
 
                 Python::attach(|py| {
                     _ = pysig.get().release(py);
@@ -558,11 +587,13 @@ macro_rules! gen_serve_match_files {
 
 macro_rules! gen_serve_match {
     ($sm:expr, $acceptor_plain:ident, $acceptor_tls:ident, $self:expr, $py:expr, $callback:expr, $event_loop:expr, $signal:expr, $target:expr, $targetws:expr) => {{
-        if $self.config.monitoring
-            && let crate::workers::SchedulerConfig::Fair(cfg) = &$self.config.scheduler
-            && let Err(err) = crate::accounting::install_monitoring($py, $callback.get(), cfg.get().monitoring_tool_id)
-        {
-            log::error!("Cannot install sys.monitoring hooks for lane occupancy: {err:?}");
+        if $self.config.monitoring {
+            $self.config.load.set_monitor_target(
+                $py,
+                $callback.get(),
+                $self.config.monitoring_tool_id,
+                matches!($self.config.scheduler, crate::workers::SchedulerConfig::Fair(_)),
+            );
         }
 
         let metrics_obj = std::sync::Arc::new(crate::metrics::WorkerMetrics::new());

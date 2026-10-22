@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .._futures import _future_watcher_wrapper, _new_cbscheduler
-from .._granian import ASGIWorker, FairConfig, RSGIWorker, WorkerSignal
+from .._granian import ASGIWorker, FairConfig, LoadAggregator, RSGIWorker, WorkerSignal
 from .._imports import dotenv
 from .._internal import load_env
 from .._types import SSLCtx
@@ -16,6 +16,7 @@ from ..asgi import LifespanProtocol, _callback_wrapper as _asgi_call_wrap
 from ..constants import Schedulers
 from ..errors import ConfigurationError, FatalError
 from ..rsgi import _callback_wrapper as _rsgi_call_wrap, _callbacks_from_target as _rsgi_cbs_from_target
+from ..stats import stats_reporter
 from .common import (
     _PY_312,
     _PYV,
@@ -125,7 +126,8 @@ class Server(AbstractServer[AsyncWorker]):
         ),
         fq_inner_cookies: str | Sequence[str] = 'sessionid,session',
         fq_inner_include_ip: bool = True,
-        fq_monitoring_tool_id: int = 4,
+        monitoring_tool_id: int | None = None,
+        fq_monitoring_tool_id: int | None = None,
         http1_settings: HTTP1Settings | None = None,
         http2_settings: HTTP2Settings | None = None,
         log_enabled: bool = True,
@@ -176,6 +178,7 @@ class Server(AbstractServer[AsyncWorker]):
             fq_inner_headers=fq_inner_headers,
             fq_inner_cookies=fq_inner_cookies,
             fq_inner_include_ip=fq_inner_include_ip,
+            monitoring_tool_id=monitoring_tool_id,
             fq_monitoring_tool_id=fq_monitoring_tool_id,
             http1_settings=http1_settings,
             http2_settings=http2_settings,
@@ -227,6 +230,8 @@ class Server(AbstractServer[AsyncWorker]):
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
                 self.fq_config,
+                self.monitoring_tool_id,
+                self._load,
             ),
             sig=sig,
         )
@@ -254,6 +259,8 @@ class Server(AbstractServer[AsyncWorker]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
     ):
         wcallback = _future_watcher_wrapper(_asgi_call_wrap(callback, scope_opts, {}, log_access_fmt))
         fut = loop.create_future()
@@ -283,11 +290,15 @@ class Server(AbstractServer[AsyncWorker]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             (None, None),
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = worker.serve_async_uds if (sock[0] or sock[1]).is_uds() else worker.serve_async
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         await fut
+        stats_reporter._detach(worker_id)
 
     @staticmethod
     @AsyncWorker.wrap_target
@@ -312,6 +323,8 @@ class Server(AbstractServer[AsyncWorker]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
     ):
         lifespan_handler = LifespanProtocol(callback)
         wcallback = _future_watcher_wrapper(
@@ -350,11 +363,15 @@ class Server(AbstractServer[AsyncWorker]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             (None, None),
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = worker.serve_async_uds if (sock[0] or sock[1]).is_uds() else worker.serve_async
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         await fut
+        stats_reporter._detach(worker_id)
         await lifespan_handler.shutdown()
 
     @staticmethod
@@ -380,6 +397,8 @@ class Server(AbstractServer[AsyncWorker]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
     ):
         callback, callback_init, callback_del = _rsgi_cbs_from_target(callback)
         wcallback = _future_watcher_wrapper(_rsgi_call_wrap(callback, log_access_fmt))
@@ -412,11 +431,15 @@ class Server(AbstractServer[AsyncWorker]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             (None, None),
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = worker.serve_async_uds if (sock[0] or sock[1]).is_uds() else worker.serve_async
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         await fut
+        stats_reporter._detach(worker_id)
         callback_del(loop)
 
     async def _respawn_workers(self, workers, spawn_target, target_loader, delay: float = 0):
@@ -455,6 +478,10 @@ class Server(AbstractServer[AsyncWorker]):
 
     def startup(self, spawn_target, target_loader):
         logger.info('Starting granian (embedded)')
+        self._validate_stats_reporter()
+        self._load_sig = WorkerSignal()
+        self._load = LoadAggregator(self.workers, stats_reporter._deliver)
+        self._load.run_local(self._load_sig)
         self._init_shared_socket()
         proto = 'https' if self.ssl_ctx[0] else 'http'
         logger.info(f'Listening at: {proto}://{self._bind_addr_fmt}')
@@ -478,6 +505,7 @@ class Server(AbstractServer[AsyncWorker]):
     async def shutdown(self, exit_code=0):
         logger.info('Shutting down granian')
         await self._stop_workers()
+        self._load_sig.set()
         self._call_hooks(self.hooks_shutdown)
         if self.bind_uds and self.bind_uds.exists():
             self.bind_uds.unlink()

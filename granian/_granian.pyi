@@ -1,4 +1,5 @@
 import sys
+from collections.abc import Callable
 from typing import Any
 
 from ._types import WebsocketMessage
@@ -75,7 +76,11 @@ class ASGIWorker:
         ssl_crl: list[str],
         ssl_client_verify: bool,
         scheduler: FairConfig | None = None,
+        metrics: tuple[int | None, MetricsAggregator | None] = (None, None),
+        monitoring_tool_id: int = 4,
+        load: LoadAggregator | int | None = None,
     ) -> ASGIWorker: ...
+    def load_handle(self) -> LoadHandle: ...
 
 class WSGIWorker:
     def __new__(
@@ -100,7 +105,11 @@ class WSGIWorker:
         ssl_crl: list[str],
         ssl_client_verify: bool,
         scheduler: FairConfig | None = None,
+        metrics: tuple[int | None, MetricsAggregator | None] = (None, None),
+        monitoring_tool_id: int = 4,
+        load: LoadAggregator | int | None = None,
     ) -> WSGIWorker: ...
+    def load_handle(self) -> LoadHandle: ...
 
 class RSGIWorker:
     def __new__(
@@ -126,7 +135,11 @@ class RSGIWorker:
         ssl_crl: list[str],
         ssl_client_verify: bool,
         scheduler: FairConfig | None = None,
+        metrics: tuple[int | None, MetricsAggregator | None] = (None, None),
+        monitoring_tool_id: int = 4,
+        load: LoadAggregator | int | None = None,
     ) -> RSGIWorker: ...
+    def load_handle(self) -> LoadHandle: ...
 
 class SocketHolder:
     def get_fd(self) -> Any: ...
@@ -150,8 +163,6 @@ class CallbackScheduler:
     def _run(self, coro: Any) -> None: ...
 
 class FairConfig:
-    monitoring_tool_id: int
-
     def __init__(
         self,
         outer_prefix_v4: int = ...,
@@ -167,7 +178,6 @@ class FairConfig:
         inner_headers: list[str] = ...,
         inner_cookies: list[str] = ...,
         inner_include_ip: bool = ...,
-        monitoring_tool_id: int = ...,
     ) -> None: ...
 
 class ProcInfoCollector:
@@ -191,3 +201,13 @@ class MetricsAggregator:
 class MetricsExporter:
     def __init__(self, aggregator: MetricsAggregator): ...
     def run(self, sock: SocketHolder, sig: WorkerSignal): ...
+
+class LoadHandle:
+    def enable(self) -> None: ...
+    def set_deliver(self, deliver: Callable[..., None]) -> None: ...
+    def push_system(self, cb: Callable[[], Any]) -> bool: ...
+
+class LoadAggregator:
+    def __init__(self, slots: int, deliver: Callable[..., None] | None = None): ...
+    def run_local(self, sig: WorkerSignal): ...
+    def run(self, sig: WorkerSignal, fds: list[int]): ...

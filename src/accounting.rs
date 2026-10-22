@@ -4,6 +4,9 @@
 //! `sys.monitoring`: the callbacks registered here start a timer whenever the request's
 //! root task step begins and stop it when the step suspends. WSGI requests are measured
 //! directly in Rust, since a request holds its pool thread for the whole call.
+//!
+//! The same measurements feed the load stats (`crate::load`) when they are enabled, with
+//! or without the fair scheduler.
 
 use pyo3::{prelude::*, types::PyTuple};
 use std::{
@@ -15,14 +18,29 @@ use std::{
 use super::{callbacks::CallbackScheduler, runtime::RequestRt};
 
 /// The accumulator shared by a request's protocol object and its Python context.
-#[derive(Default)]
 pub(crate) struct AcctState {
     ns: atomic::AtomicU64,
+    /// Set when the worker measured load as the request started; keeps it counted as in flight.
+    load: Option<crate::load::InFlight>,
 }
 
 impl AcctState {
+    fn new(rt: &RequestRt) -> Self {
+        Self {
+            ns: atomic::AtomicU64::new(0),
+            load: rt.rt.load().and_then(crate::load::WorkerLoad::in_flight),
+        }
+    }
+
+    fn worker_load(&self) -> Option<&crate::load::WorkerLoad> {
+        self.load.as_ref().map(crate::load::InFlight::worker)
+    }
+
     fn add(&self, ns: u64) {
         self.ns.fetch_add(ns, atomic::Ordering::Relaxed);
+        if let Some(load) = self.worker_load() {
+            load.add_busy(ns);
+        }
     }
 
     fn take(&self) -> u64 {
@@ -47,7 +65,7 @@ pub(crate) struct RequestAcct {
 impl RequestAcct {
     pub(crate) fn new(rt: RequestRt) -> Self {
         Self {
-            state: Arc::new(AcctState::default()),
+            state: Arc::new(AcctState::new(&rt)),
             rt,
         }
     }
@@ -55,6 +73,13 @@ impl RequestAcct {
 
 #[pymethods]
 impl RequestAcct {
+    /// Whether the request is scheduled by the fair queue, i.e. must take turns on the loop.
+    /// Without it, the handle only exists to measure the request for load stats.
+    #[getter]
+    fn fair(&self) -> bool {
+        self.rt.flow.is_some()
+    }
+
     /// Queue for the loop lane; `fut` gets resolved once it is this request's turn.
     /// Returns `True` when the caller must schedule `lane_dispatch` with `call_soon`.
     fn lane_wait(&self, py: Python<'_>, fut: Py<PyAny>) -> PyResult<bool> {
@@ -95,20 +120,35 @@ thread_local! {
 }
 
 fn step_start(state: Arc<AcctState>) {
-    CURRENT.with(|c| *c.borrow_mut() = Some((state, Instant::now())));
+    if let Some(load) = state.worker_load() {
+        load.lane_busy();
+    }
+    let prev = CURRENT.with(|c| c.borrow_mut().replace((state, Instant::now())));
+    if let Some((prev, _)) = prev
+        && let Some(load) = prev.worker_load()
+    {
+        load.lane_idle();
+    }
 }
 
 fn step_end() {
     CURRENT.with(|c| {
         if let Some((state, t0)) = c.borrow_mut().take() {
             state.add(t0.elapsed().as_nanos() as u64);
+            if let Some(load) = state.worker_load() {
+                load.lane_idle();
+            }
         }
     });
 }
 
 fn clear_current() {
     CURRENT.with(|c| {
-        c.borrow_mut().take();
+        if let Some((state, _)) = c.borrow_mut().take()
+            && let Some(load) = state.worker_load()
+        {
+            load.lane_idle();
+        }
     });
 }
 
@@ -247,7 +287,7 @@ impl MonitoringEnd {
 }
 
 /// Create a per-request `RequestAcct` and the context that carries it, when the request is
-/// tracked by the scheduler (`tracked` is then its runtime handle).
+/// tracked by the scheduler or measured for load stats (`tracked` is then its runtime handle).
 pub(crate) fn build_acct(
     py: Python<'_>,
     scheduler: &CallbackScheduler,
@@ -271,9 +311,16 @@ pub(crate) fn build_acct(
     }
 }
 
-/// Install the `sys.monitoring` hooks used to measure async lane occupancy. Only the code
-/// object of `future_watcher` is instrumented, so no other code pays for monitoring.
-pub(crate) fn install_monitoring(py: Python<'_>, scheduler: &CallbackScheduler, tool_id: u8) -> PyResult<()> {
+/// Install the `sys.monitoring` hooks used to measure async lane occupancy, once per process:
+/// `sys.monitoring` tools are process-wide, and every worker of the process shares the same
+/// `future_watcher` code object (`code`). Only that code object is instrumented, so no
+/// other code pays for monitoring.
+pub(crate) fn install_monitoring_once(py: Python<'_>, code: &Bound<'_, PyAny>, tool_id: u8) -> PyResult<()> {
+    static INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if INSTALLED.swap(true, atomic::Ordering::AcqRel) {
+        return Ok(());
+    }
+
     let monitoring = py.import("sys")?.getattr("monitoring")?;
     let events = monitoring.getattr("events")?;
 
@@ -290,8 +337,6 @@ pub(crate) fn install_monitoring(py: Python<'_>, scheduler: &CallbackScheduler, 
         monitoring.call_method1("register_callback", (tool_id, event, end.clone_ref(py)))?;
     }
 
-    let code = scheduler.cb.getattr(py, "__code__")?;
-
     // Not every step event can be attached to a code object: CPython rejects e.g.
     // `PY_THROW` / `PY_UNWIND` as local events on some versions. Probe each event and
     // keep only the ones this interpreter accepts.
@@ -306,7 +351,7 @@ pub(crate) fn install_monitoring(py: Python<'_>, scheduler: &CallbackScheduler, 
     ] {
         let event = events.getattr(name)?.extract::<u32>()?;
         if monitoring
-            .call_method1("set_local_events", (tool_id, &code, event))
+            .call_method1("set_local_events", (tool_id, code, event))
             .is_ok()
         {
             mask |= event;

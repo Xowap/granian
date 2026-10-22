@@ -6,12 +6,13 @@ from functools import wraps
 from typing import Any
 
 from .._futures import _future_watcher_wrapper, _new_cbscheduler
-from .._granian import ASGIWorker, FairConfig, RSGIWorker, WorkerSignal, WSGIWorker
+from .._granian import ASGIWorker, FairConfig, LoadAggregator, RSGIWorker, WorkerSignal, WSGIWorker
 from .._loops import close_active_loop, loops
 from .._types import SSLCtx
 from ..asgi import LifespanProtocol, _callback_wrapper as _asgi_call_wrap
 from ..errors import ConfigurationError, FatalError
 from ..rsgi import _callback_wrapper as _rsgi_call_wrap, _callbacks_from_target as _rsgi_cbs_from_target
+from ..stats import stats_reporter
 from ..wsgi import _callback_wrapper as _wsgi_call_wrap
 from .common import (
     WORKERS_METHODS,
@@ -96,6 +97,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
         metrics: Any,
     ):
         wcallback = _future_watcher_wrapper(_asgi_call_wrap(callback, scope_opts, {}, log_access_fmt))
@@ -129,11 +132,15 @@ class MTServer(AbstractServer[WorkerThread]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
 
     @staticmethod
     @WorkerThread.wrap_target
@@ -159,6 +166,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
         metrics: Any,
     ):
         lifespan_handler = LifespanProtocol(callback)
@@ -200,11 +209,15 @@ class MTServer(AbstractServer[WorkerThread]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
         loop.run_until_complete(lifespan_handler.shutdown())
 
     @staticmethod
@@ -231,6 +244,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
         metrics: Any,
     ):
         callback, callback_init, callback_del = _rsgi_cbs_from_target(callback)
@@ -267,11 +282,15 @@ class MTServer(AbstractServer[WorkerThread]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), True, loop)
         serve(scheduler, loop, shutdown_event)
         loop.run_until_complete(_main())
+        stats_reporter._detach(worker_id)
         callback_del(loop)
 
     @staticmethod
@@ -298,6 +317,8 @@ class MTServer(AbstractServer[WorkerThread]):
         ssl_ctx: SSLCtx,
         scope_opts: dict[str, Any],
         fq_config: dict[str, Any] | None,
+        monitoring_tool_id: int,
+        load: Any,
         metrics: Any,
     ):
         wcallback = _wsgi_call_wrap(callback, scope_opts, log_access_fmt)
@@ -327,11 +348,15 @@ class MTServer(AbstractServer[WorkerThread]):
             *ssl_ctx,
             FairConfig(**fq_config) if fq_config else None,
             metrics,
+            monitoring_tool_id=monitoring_tool_id,
+            load=load,
         )
         serve = getattr(worker, WORKERS_METHODS[runtime_mode][(sock[0] or sock[1]).is_uds()])
         scheduler = _new_cbscheduler(loop, wcallback, impl_asyncio=task_impl == TaskImpl.asyncio)
+        stats_reporter._attach(worker_id, worker.load_handle(), False)
         serve(scheduler, loop, shutdown_event)
         _main()
+        stats_reporter._detach(worker_id)
 
     def _spawn_worker(self, idx, target, callback_loader) -> WorkerThread:
         sig = WorkerSignal()
@@ -362,10 +387,21 @@ class MTServer(AbstractServer[WorkerThread]):
                 self.ssl_ctx,
                 {'url_path_prefix': self.url_path_prefix},
                 self.fq_config,
+                self.monitoring_tool_id,
+                self._load,
                 (self.metrics_scrape_interval if self.metrics_enabled else None, self._metrics),
             ),
             sig=sig,
         )
+
+    def _start_ipc(self):
+        # NOTE: workers are threads of this process: their load is aggregated in-process.
+        self._load_sig = WorkerSignal()
+        self._load = LoadAggregator(self.workers, stats_reporter._deliver)
+        self._load.run_local(self._load_sig)
+
+    def _stop_ipc(self):
+        self._load_sig.set()
 
     def _check_gil(self):
         try:

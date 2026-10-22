@@ -42,6 +42,8 @@ impl WSGIWorker {
             ssl_client_verify=false,
             scheduler=None,
             metrics=(None, None),
+            monitoring_tool_id=4,
+            load=None,
         )
     )]
     fn new(
@@ -68,34 +70,41 @@ impl WSGIWorker {
         ssl_client_verify: bool,
         scheduler: Option<Py<crate::scheduler::FairConfig>>,
         metrics: (Option<u64>, Option<Py<crate::metrics::MetricsAggregator>>),
+        monitoring_tool_id: u8,
+        load: Option<Bound<PyAny>>,
     ) -> PyResult<Self> {
-        Ok(Self {
-            config: WorkerConfig::new(
-                worker_id,
-                sock,
-                ipc,
-                threads,
-                blocking_threads,
-                py_threads,
-                py_threads_idle_timeout,
-                backpressure,
-                http_mode,
-                worker_http1_config_from_py(py, http1_opts)?,
-                worker_http2_config_from_py(py, http2_opts)?,
-                false,
-                static_files,
-                ssl_enabled,
-                ssl_cert,
-                ssl_key,
-                ssl_key_password,
-                ssl_protocol_min,
-                ssl_ca,
-                ssl_crl,
-                ssl_client_verify,
-                scheduler,
-                metrics,
-            ),
-        })
+        let config = WorkerConfig::new(
+            worker_id,
+            sock,
+            ipc,
+            threads,
+            blocking_threads,
+            py_threads,
+            py_threads_idle_timeout,
+            backpressure,
+            http_mode,
+            worker_http1_config_from_py(py, http1_opts)?,
+            worker_http2_config_from_py(py, http2_opts)?,
+            false,
+            static_files,
+            ssl_enabled,
+            ssl_cert,
+            ssl_key,
+            ssl_key_password,
+            ssl_protocol_min,
+            ssl_ca,
+            ssl_crl,
+            ssl_client_verify,
+            scheduler,
+            metrics,
+        )
+        .with_load(false, monitoring_tool_id, load.as_ref())?;
+        Ok(Self { config })
+    }
+
+    /// The worker's load, for `granian.stats.stats_reporter`.
+    fn load_handle(&self) -> crate::load::LoadHandle {
+        crate::load::LoadHandle::new(self.config.load.clone())
     }
 
     fn serve_mtr(

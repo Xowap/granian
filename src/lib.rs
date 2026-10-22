@@ -18,6 +18,7 @@ mod conversion;
 mod files;
 mod http;
 mod ipc;
+mod load;
 mod metrics;
 mod net;
 mod rsgi;
@@ -54,6 +55,7 @@ fn _granian(py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     module.add_function(pyo3::wrap_pyfunction!(accounting::request_acct_var, module)?)?;
     asgi::init_pymodule(module)?;
     ipc::init_pymodule(module)?;
+    load::init_pymodule(module)?;
     metrics::init_pymodule(module)?;
     rsgi::init_pymodule(py, module)?;
     sys::init_pymodule(module)?;

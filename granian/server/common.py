@@ -22,6 +22,7 @@ from ..errors import ConfigurationError, PidFileError
 from ..http import HTTP1Settings, HTTP2Settings
 from ..log import DEFAULT_ACCESSLOG_FMT, LogLevels, configure_logging, logger
 from ..net import SocketSpec, UnixSocketSpec
+from ..stats import stats_reporter
 
 
 WT = TypeVar('WT')
@@ -123,7 +124,8 @@ class AbstractServer(Generic[WT]):
         ),
         fq_inner_cookies: str | Sequence[str] = 'sessionid,session',
         fq_inner_include_ip: bool = True,
-        fq_monitoring_tool_id: int = 4,
+        monitoring_tool_id: int | None = None,
+        fq_monitoring_tool_id: int | None = None,
         http1_settings: HTTP1Settings | None = None,
         http2_settings: HTTP2Settings | None = None,
         log_enabled: bool = True,
@@ -206,10 +208,13 @@ class AbstractServer(Generic[WT]):
                 fq_inner_headers,
                 fq_inner_cookies,
                 fq_inner_include_ip,
-                fq_monitoring_tool_id,
             )
             if self.scheduler == Schedulers.fair
             else None
+        )
+        #: `fq_monitoring_tool_id` is the former name, kept as an alias.
+        self.monitoring_tool_id = next(
+            (value for value in (monitoring_tool_id, fq_monitoring_tool_id) if value is not None), 4
         )
         self.http1_settings = http1_settings
         self.http2_settings = http2_settings
@@ -300,7 +305,6 @@ class AbstractServer(Generic[WT]):
         inner_headers: str | Sequence[str],
         inner_cookies: str | Sequence[str],
         inner_include_ip: bool,
-        monitoring_tool_id: int,
     ) -> dict[str, Any]:
         "Collect the fair-scheduler options into the primitive dict the workers turn into a FairConfig."
         return {
@@ -317,7 +321,6 @@ class AbstractServer(Generic[WT]):
             'inner_headers': AbstractServer._split_fq_list(inner_headers),
             'inner_cookies': AbstractServer._split_fq_list(inner_cookies),
             'inner_include_ip': inner_include_ip,
-            'monitoring_tool_id': monitoring_tool_id,
         }
 
     def _validate_scheduler(self) -> None:
@@ -574,9 +577,16 @@ class AbstractServer(Generic[WT]):
     def _stop_metrics(self):
         self._metrics_sig.set()
 
+    def _validate_stats_reporter(self) -> None:
+        """Fail early when the application, imported in this process, subscribed to load stats
+        the interface can't measure (async interfaces need Python >= 3.12). Workers re-check
+        this on their own when the application is imported there instead."""
+        stats_reporter._validate(self.interface != Interfaces.WSGI)
+
     def startup(self, spawn_target, target_loader):
         self.pid = os.getpid()
         logger.info(f'Starting granian (main PID: {self.pid})')
+        self._validate_stats_reporter()
         self._write_pidfile()
         set_main_signals(self.signal_handler_interrupt, self.signal_handler_reload)
         self._init_shared_socket()
